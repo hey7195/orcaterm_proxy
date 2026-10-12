@@ -29,8 +29,13 @@ API_KEY = os.environ.get('API_KEY', '')
 # 注入到每次请求最前的系统提示,覆盖上游默认的"OrcaTerm AI 运维助手"人设
 INJECT_SYSTEM = os.environ.get('INJECT_SYSTEM', '')
 
-# 拼在 emphasisPrompt 尾部:让模型输出纯文本,不包 agent JSON 壳——流式才能实时透传
+# 拼在 emphasisPrompt 尾部的格式护栏,按请求形态二选一:
+# 带 tools(agent 客户端) -> 鼓励原生 JSON 工具调用且必须给完整命令(反代桥接用);
+# 无 tools(纯聊天) -> 纯文本输出,流式才能实时透传。
 _FMT_GUARD = '输出格式硬性要求:直接以纯文本/Markdown 回答。严禁输出 {"action":...} JSON 动作对象或调用任何工具。需要执行命令时把命令写进 ```bash 代码块,由宿主执行。'
+_FMT_GUARD_TOOLS = ('工具调用硬性要求:需要执行命令或抓取网页时,用原生 JSON 动作格式输出,'
+                    '且 args.command 必须是完整、可直接执行的真实命令——禁止只写自然语言描述。'
+                    '严禁使用 <tool_call> XML 或任何非 JSON 格式。纯文本回答直接写,不要包 JSON。')
 CDP_PORT = int(os.environ.get('CDP_PORT', '9223'))  # OrcaTerm 带 --remote-debugging-port 启动时可用
 
 # 实测可用的模型(上游对未开通/不存在的模型名返回空流,所以只列已验证的)
@@ -179,10 +184,9 @@ def build_upstream_body(openai_body, user_id):
         tag = {'user': 'User', 'assistant': 'Assistant', 'tool': 'Tool'}.get(role, role)
         parts.append(f'[{tag}]\n{content}')
     emphasis = '\n\n'.join([INJECT_SYSTEM] + sys_msgs) if (INJECT_SYSTEM or sys_msgs) else ''
-    if emphasis:
-        emphasis += '\n\n' + _FMT_GUARD
-    else:
-        emphasis = _FMT_GUARD
+    # 按请求形态选护栏:带 tools 用工具调用护栏(桥接需要),纯聊天用纯文本护栏(实时透传需要)
+    guard = _FMT_GUARD_TOOLS if openai_body.get('tools') else _FMT_GUARD
+    emphasis = f'{emphasis}\n\n{guard}' if emphasis else guard
     seq = str(uuid.uuid4())
     body = {
         'conversationId': 'cid-' + str(uuid.uuid4()) + '-orcaterm',
@@ -287,11 +291,19 @@ def pick_exec_tool(tools):
 
 def bridge_tool_call(agent_json, openai_body):
     """上游 tool JSON -> OpenAI tool_calls(桥接到客户端声明的执行类工具)。
-    返回 {'id','name','arguments'(str)} 或 None(无可桥接工具时走文本转译)。"""
+    支持两类上游工具:
+    - execute_command 系(args.command) -> 直接给宿主 Bash
+    - fetch/web-fetch 系(args.url)     -> 翻译成 curl 命令给宿主 Bash(宿主通常没有原生 fetch 工具)
+    返回 {'id','name','arguments'(str)} 或 None(无可桥接时走文本转译)。"""
     ut = agent_json.get('tool')
     if not isinstance(ut, dict) or not openai_body.get('tools'):
         return None
-    cmd = (ut.get('args') or {}).get('command')
+    args = ut.get('args') or {}
+    cmd = args.get('command')
+    if not cmd and args.get('url'):
+        # fetch 调用翻译成 curl(GitHub 等站点需要 UA 和 -L 跟随跳转)
+        maxlen = args.get('maxLength') or 10000
+        cmd = f"curl -sL -A 'Mozilla/5.0' '{args['url']}' | head -c {int(maxlen)}"
     if not cmd:
         return None
     tname, akey = pick_exec_tool(openai_body['tools'])
