@@ -441,11 +441,13 @@ class Handler(BaseHTTPRequestHandler):
             return ('data: ' + json.dumps(chunk, ensure_ascii=False) + '\n\n').encode()
 
         try:
-            # 流式策略:开头像 agent JSON 壳才攒完整流剥壳;纯文本(_FMT_GUARD 生效后是常态)
-            # 逐 chunk 实时透传。攒壳期间发 SSE 注释行心跳,客户端不至于等死。
+            # 流式策略:纯文本(_FMT_GUARD 生效后是常态)逐 chunk 实时透传;
+            # 但壳标志可能在文本中间出现(模型先说话再吐 ```json {"action":...}```),
+            # passthrough 期间持续探测,发现即转攒壳。攒壳期间发 SSE 注释行心跳。
             full_content, full_reasoning = '', ''
-            pending = []          # 攢壳模式下的 content 片段
-            mode = 'probe'        # probe -> passthrough | buffer
+            passed_text = ''      # passthrough 阶段已透传的正文(转 buffer 后,壳部分从这之后切)
+            pending = []          # 攒壳模式下的 content 片段
+            mode = 'probe'        # probe -> passthrough | buffer;passthrough -可-> buffer
             last_beat = time.time()
             for ev in iter_sse(resp, watchdog=UPSTREAM_TIMEOUT):
                 now = time.time()
@@ -468,6 +470,12 @@ class Handler(BaseHTTPRequestHandler):
                         if looks_like_agent_json(full_content) and len(full_content.strip()) < 24:
                             continue  # 还不能确定,继续攒
                         mode = 'buffer' if looks_like_agent_json(full_content) else 'passthrough'
+                elif mode == 'passthrough' and ('```json' in full_content or '{"action"' in full_content):
+                    # 中途冒出壳标志:转攒壳。passed_text 取壳标志之前的部分
+                    # (被截断的标志串会在下一个 chunk 补全,这里每次都重算)
+                    cut = max(full_content.rfind('```json'), full_content.rfind('{"action"'))
+                    passed_text = full_content[:cut] if cut > 0 else ''
+                    mode = 'buffer'
                 if mode == 'passthrough':
                     self.wfile.write(sse_chunk(delta_content=c))
                     self.wfile.flush()
@@ -477,8 +485,9 @@ class Handler(BaseHTTPRequestHandler):
             if mode == 'passthrough':
                 self.wfile.write(sse_chunk(finish='stop'))
             else:
-                # 壳模式:剥完一次性发(tool_calls 桥接或纯文本)
-                agent_json = parse_agent_json(full_content)
+                # 壳模式:正文前缀(若有)已透传;壳部分剥完一次性发(tool_calls 桥接或纯文本)
+                shell_text = full_content[len(passed_text):]
+                agent_json = parse_agent_json(shell_text)
                 bridged = bridge_tool_call(agent_json, openai_body) if agent_json is not None else None
                 if bridged is not None:
                     if agent_json.get('thinking'):
@@ -488,8 +497,8 @@ class Handler(BaseHTTPRequestHandler):
                         'function': {'name': bridged['name'], 'arguments': bridged['arguments']}}]))
                     self.wfile.write(sse_chunk(finish='tool_calls'))
                 else:
-                    unwrapped = try_unwrap_agent_json(full_content)
-                    self.wfile.write(sse_chunk(delta_content=unwrapped if unwrapped is not None else full_content))
+                    unwrapped = try_unwrap_agent_json(shell_text)
+                    self.wfile.write(sse_chunk(delta_content=unwrapped if unwrapped is not None else shell_text))
                     self.wfile.write(sse_chunk(finish='stop'))
             self.wfile.write(b'data: [DONE]\n\n')
             self.wfile.flush()
