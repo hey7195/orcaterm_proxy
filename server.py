@@ -149,16 +149,23 @@ def load_creds():
 
 
 def build_upstream_body(openai_body, user_id):
-    """OpenAI messages -> LightAI chat body。多轮对话拼成一段文本(acp-prompt 只有一条 text)。"""
+    """OpenAI messages -> LightAI chat body。
+    system 消息和 INJECT_SYSTEM 走 emphasisPrompt(服务端高优先级,能压过 OrcaTerm 人设),
+    其余角色拼成文本进 acp-prompt。"""
     model = MODELS.get(openai_body.get('model', DEFAULT_MODEL), 'TokenHub/glm-5.3')
-    parts = []
+    sys_msgs, parts = [], []
     for m in openai_body.get('messages', []):
         role = m['role']
         content = m.get('content') or ''
         if isinstance(content, list):  # 多模态拍平
             content = '\n'.join(c.get('text', '') for c in content if isinstance(c, dict))
-        tag = {'system': 'System', 'user': 'User', 'assistant': 'Assistant', 'tool': 'Tool'}.get(role, role)
+        if role in ('system', 'developer'):
+            if content:
+                sys_msgs.append(content)
+            continue
+        tag = {'user': 'User', 'assistant': 'Assistant', 'tool': 'Tool'}.get(role, role)
         parts.append(f'[{tag}]\n{content}')
+    emphasis = '\n\n'.join([INJECT_SYSTEM] + sys_msgs) if (INJECT_SYSTEM or sys_msgs) else ''
     seq = str(uuid.uuid4())
     body = {
         'conversationId': 'cid-' + str(uuid.uuid4()) + '-orcaterm',
@@ -173,7 +180,7 @@ def build_upstream_body(openai_body, user_id):
                                        'prompt': [{'type': 'text', 'text': '\n\n'.join(parts)}]}),
                   'id': seq,
                   # emphasisPrompt 在服务端拼到系统提示词后部,能压过 OrcaTerm 默认人设——注入就走这里
-                  'emphasisPrompt': INJECT_SYSTEM,
+                  'emphasisPrompt': emphasis,
                   'files': []},
         'stream': True,
     }
@@ -225,7 +232,10 @@ def extract_text(obj):
 
 def try_unwrap_agent_json(full_text):
     """模型常输出 ```json {"action":"...","taskCompletion":"..."} ```,
-    反代给其他 agent 用时应剥掉这层壳,取用户可读的文本字段。"""
+    反代给其他 agent 用时应剥掉这层壳,取用户可读的文本字段。
+    变体: completion/ask 有 taskCompletion/question;
+    review/thinking 直接带 thinking 或内嵌 tool 调用(OpenAI 客户端无法执行,
+    降级为"想执行什么命令"的可读说明)。"""
     # 兼容无 ``` 包裹的裸 JSON
     m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', full_text, re.S) \
         or re.fullmatch(r'\s*(\{.*?\})\s*', full_text, re.S)
@@ -240,6 +250,12 @@ def try_unwrap_agent_json(full_text):
     for k in ('taskCompletion', 'question', 'answer', 'content', 'result'):
         if o.get(k):
             return o[k]
+    tool = o.get('tool')
+    if isinstance(tool, dict):
+        cmd = tool.get('args', {}).get('command') or tool.get('description') or json.dumps(tool.get('args', {}), ensure_ascii=False)
+        return f'[模型请求执行工具 {tool.get("name", "?")}: {cmd} — 反代无工具执行能力,已转为文本]'
+    if o.get('thinking'):
+        return o['thinking']
     return None
 
 
