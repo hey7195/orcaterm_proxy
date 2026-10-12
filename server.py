@@ -28,6 +28,9 @@ UPSTREAM = 'https://lightai.cloud.tencent.com/assistant/chat?name=orcaterm&mode=
 API_KEY = os.environ.get('API_KEY', '')
 # 注入到每次请求最前的系统提示,覆盖上游默认的"OrcaTerm AI 运维助手"人设
 INJECT_SYSTEM = os.environ.get('INJECT_SYSTEM', '')
+
+# 拼在 emphasisPrompt 尾部:让模型输出纯文本,不包 agent JSON 壳——流式才能实时透传
+_FMT_GUARD = '输出格式硬性要求:直接以纯文本/Markdown 回答。严禁输出 {"action":...} JSON 动作对象或调用任何工具。需要执行命令时把命令写进 ```bash 代码块,由宿主执行。'
 CDP_PORT = int(os.environ.get('CDP_PORT', '9223'))  # OrcaTerm 带 --remote-debugging-port 启动时可用
 
 # 实测可用的模型(上游对未开通/不存在的模型名返回空流,所以只列已验证的)
@@ -37,8 +40,18 @@ MODELS = {
 }
 DEFAULT_MODEL = 'glm-5.3'
 
+UPSTREAM_TIMEOUT = int(os.environ.get('UPSTREAM_TIMEOUT', '600'))  # 上游总时长看门狗(秒)
+HEARTBEAT_SEC = float(os.environ.get('HEARTBEAT_SEC', '15'))  # SSE 心跳间隔,防客户端等死
+
 # 上游直连,不走系统代理(代理会缓冲 SSE 流)
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def looks_like_agent_json(text):
+    """流式前缀探测:开头是否像 agent JSON 壳({ 或 ```json)。
+    像才需要攒完整流剥壳,否则纯文本实时透传。"""
+    t = text.lstrip()
+    return t.startswith('{') or t.startswith('```')
 
 # token 缓存:OrcaTerm 刷新 token 后不一定回写 data.bin(实测 19:02 换的 token 只在前端内存),
 # 所以优先走 CDP 从前端拿活 token,拿不到再退回 data.bin。
@@ -166,6 +179,10 @@ def build_upstream_body(openai_body, user_id):
         tag = {'user': 'User', 'assistant': 'Assistant', 'tool': 'Tool'}.get(role, role)
         parts.append(f'[{tag}]\n{content}')
     emphasis = '\n\n'.join([INJECT_SYSTEM] + sys_msgs) if (INJECT_SYSTEM or sys_msgs) else ''
+    if emphasis:
+        emphasis += '\n\n' + _FMT_GUARD
+    else:
+        emphasis = _FMT_GUARD
     seq = str(uuid.uuid4())
     body = {
         'conversationId': 'cid-' + str(uuid.uuid4()) + '-orcaterm',
@@ -200,12 +217,14 @@ def open_upstream(openai_body):
         'x-seqid': seq,
         'User-Agent': 'Mozilla/5.0',
     })
-    return _opener.open(req, timeout=300)
+    return _opener.open(req, timeout=UPSTREAM_TIMEOUT)
 
 
-def iter_sse(resp):
-    """yield 每个 data: JSON 对象。逐字节读避免 read(n) 凑缓冲阻塞流式。"""
+def iter_sse(resp, watchdog=None):
+    """yield 每个 data: JSON 对象。逐字节读避免 read(n) 凑缓冲阻塞流式。
+    watchdog: 无数据的秒数超过它就抛 TimeoutError(上游卡死时别让客户端永远等)。"""
     buf = b''
+    last_data = time.time()
     while True:
         b_ = resp.read(1)
         if not b_:
@@ -219,9 +238,13 @@ def iter_sse(resp):
                 if payload == b'[DONE]':
                     return
                 try:
-                    yield json.loads(payload)
+                    o = json.loads(payload)
                 except json.JSONDecodeError:
-                    pass
+                    continue
+                last_data = time.time()
+                yield o
+        if watchdog and time.time() - last_data > watchdog:
+            raise TimeoutError(f'upstream silent for {watchdog}s')
 
 
 def extract_text(obj):
@@ -367,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if not stream:
             content, reasoning = '', ''
-            for ev in iter_sse(resp):
+            for ev in iter_sse(resp, watchdog=UPSTREAM_TIMEOUT):
                 c, r = extract_text(ev)
                 content += c
                 reasoning += r
@@ -418,35 +441,56 @@ class Handler(BaseHTTPRequestHandler):
             return ('data: ' + json.dumps(chunk, ensure_ascii=False) + '\n\n').encode()
 
         try:
-            # 先攒完整内容判断是否要剥 agent json 壳,流式也得剥(客户端拼出来的是全文)
+            # 流式策略:开头像 agent JSON 壳才攒完整流剥壳;纯文本(_FMT_GUARD 生效后是常态)
+            # 逐 chunk 实时透传。攒壳期间发 SSE 注释行心跳,客户端不至于等死。
             full_content, full_reasoning = '', ''
-            pending = []
-            for ev in iter_sse(resp):
+            pending = []          # 攢壳模式下的 content 片段
+            mode = 'probe'        # probe -> passthrough | buffer
+            last_beat = time.time()
+            for ev in iter_sse(resp, watchdog=UPSTREAM_TIMEOUT):
+                now = time.time()
+                if now - last_beat > HEARTBEAT_SEC:
+                    self.wfile.write(b': heartbeat\n\n')  # SSE 注释行,客户端忽略但连接不冷
+                    self.wfile.flush()
+                    last_beat = now
                 c, r = extract_text(ev)
                 if r:
                     full_reasoning += r
                     self.wfile.write(sse_chunk(delta_reasoning=r))
                     self.wfile.flush()
-                if c:
-                    full_content += c
-                    pending.append(c)
-            agent_json = parse_agent_json(full_content)
-            bridged = bridge_tool_call(agent_json, openai_body) if agent_json is not None else None
-            if bridged is not None:
-                if agent_json.get('thinking'):
-                    self.wfile.write(sse_chunk(delta_content=agent_json['thinking']))
-                self.wfile.write(sse_chunk(tool_calls=[{
-                    'index': 0, 'id': bridged['id'], 'type': 'function',
-                    'function': {'name': bridged['name'], 'arguments': bridged['arguments']}}]))
-                self.wfile.write(sse_chunk(finish='tool_calls'))
-            else:
-                unwrapped = try_unwrap_agent_json(full_content)
-                if unwrapped is not None:
-                    self.wfile.write(sse_chunk(delta_content=unwrapped))
+                    last_beat = now
+                if not c:
+                    continue
+                full_content += c
+                if mode == 'probe':
+                    # 攒到能判断为止:非空白首字符 + 内容够长(避免 {" 或 ```json 被截断误判)
+                    if full_content.strip():
+                        if looks_like_agent_json(full_content) and len(full_content.strip()) < 24:
+                            continue  # 还不能确定,继续攒
+                        mode = 'buffer' if looks_like_agent_json(full_content) else 'passthrough'
+                if mode == 'passthrough':
+                    self.wfile.write(sse_chunk(delta_content=c))
+                    self.wfile.flush()
+                    last_beat = now
                 else:
-                    for c in pending:
-                        self.wfile.write(sse_chunk(delta_content=c))
+                    pending.append(c)
+            if mode == 'passthrough':
                 self.wfile.write(sse_chunk(finish='stop'))
+            else:
+                # 壳模式:剥完一次性发(tool_calls 桥接或纯文本)
+                agent_json = parse_agent_json(full_content)
+                bridged = bridge_tool_call(agent_json, openai_body) if agent_json is not None else None
+                if bridged is not None:
+                    if agent_json.get('thinking'):
+                        self.wfile.write(sse_chunk(delta_content=agent_json['thinking']))
+                    self.wfile.write(sse_chunk(tool_calls=[{
+                        'index': 0, 'id': bridged['id'], 'type': 'function',
+                        'function': {'name': bridged['name'], 'arguments': bridged['arguments']}}]))
+                    self.wfile.write(sse_chunk(finish='tool_calls'))
+                else:
+                    unwrapped = try_unwrap_agent_json(full_content)
+                    self.wfile.write(sse_chunk(delta_content=unwrapped if unwrapped is not None else full_content))
+                    self.wfile.write(sse_chunk(finish='stop'))
             self.wfile.write(b'data: [DONE]\n\n')
             self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
