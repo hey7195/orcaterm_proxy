@@ -40,7 +40,7 @@ MODELS = {
 }
 DEFAULT_MODEL = 'glm-5.3'
 
-UPSTREAM_TIMEOUT = int(os.environ.get('UPSTREAM_TIMEOUT', '600'))  # 上游总时长看门狗(秒)
+UPSTREAM_TIMEOUT = int(os.environ.get('UPSTREAM_TIMEOUT', '120'))  # 上游无数据看门狗(秒),超时断开让客户端重试
 HEARTBEAT_SEC = float(os.environ.get('HEARTBEAT_SEC', '15'))  # SSE 心跳间隔,防客户端等死
 
 # 上游直连,不走系统代理(代理会缓冲 SSE 流)
