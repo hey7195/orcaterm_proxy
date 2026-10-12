@@ -4,6 +4,7 @@ OrcaTerm AI 反代 —— 把 OrcaTerm(腾讯云 LightAI) 的 AI 额度暴露为
 用法:
   python server.py                 # 监听 0.0.0.0:8117
   API_KEY=sk-xxx python server.py # 要求客户端带 Authorization: Bearer sk-xxx
+  INJECT_SYSTEM="..." python server.py  # 注入系统提示,覆盖上游的 OrcaTerm 运维助手人设
 
 端点:
   GET  /v1/models
@@ -25,6 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DATA_BIN = os.path.expandvars(r'%APPDATA%/com.orcaterm-desktop.app/data.bin')
 UPSTREAM = 'https://lightai.cloud.tencent.com/assistant/chat?name=orcaterm&mode=0&csrfCode=&sseresume=true'
 API_KEY = os.environ.get('API_KEY', '')
+# 注入到每次请求最前的系统提示,覆盖上游默认的"OrcaTerm AI 运维助手"人设
+INJECT_SYSTEM = os.environ.get('INJECT_SYSTEM', '')
 CDP_PORT = int(os.environ.get('CDP_PORT', '9223'))  # OrcaTerm 带 --remote-debugging-port 启动时可用
 
 # 实测可用的模型(上游对未开通/不存在的模型名返回空流,所以只列已验证的)
@@ -168,7 +171,10 @@ def build_upstream_body(openai_body, user_id):
         'input': {'type': 'start',
                   'input': json.dumps({'_format': 'acp-prompt', 'version': 1,
                                        'prompt': [{'type': 'text', 'text': '\n\n'.join(parts)}]}),
-                  'id': seq, 'emphasisPrompt': '', 'files': []},
+                  'id': seq,
+                  # emphasisPrompt 在服务端拼到系统提示词后部,能压过 OrcaTerm 默认人设——注入就走这里
+                  'emphasisPrompt': INJECT_SYSTEM,
+                  'files': []},
         'stream': True,
     }
     return body, seq
@@ -365,6 +371,7 @@ def main():
     print(f'OrcaTerm OpenAI-compatible proxy on http://127.0.0.1:{port}/v1')
     print(f'models: {", ".join(MODELS)}')
     print(f'auth: {"API_KEY required" if API_KEY else "no auth (local only)"}')
+    print(f'inject: {"on (%d chars)" % len(INJECT_SYSTEM) if INJECT_SYSTEM else "off"}')
     srv.serve_forever()
 
 
