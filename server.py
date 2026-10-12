@@ -230,6 +230,54 @@ def extract_text(obj):
     return obj.get('content') or '', obj.get('reasoningContent') or ''
 
 
+def parse_agent_json(full_text):
+    """完整解析模型输出的 agent JSON 壳,返回 dict 或 None。"""
+    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', full_text, re.S) \
+        or re.fullmatch(r'\s*(\{.*?\})\s*', full_text, re.S)
+    if not m:
+        return None
+    try:
+        o = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    return o if isinstance(o, dict) and 'action' in o else None
+
+
+def pick_exec_tool(tools):
+    """从客户端声明的 tools 里挑一个能执行命令的,返回 (name, 参数名)。
+    上游模型的工具调用本质都是 execute_command,桥接到宿主 agent 的 Bash 类工具。"""
+    name_pats = ('bash', 'shell', 'execute_command', 'run_command', 'terminal', 'exec')
+    key_pats = ('command', 'cmd', 'script', 'code', 'bash')
+    for t in tools or []:
+        if not isinstance(t, dict) or t.get('type') != 'function':
+            continue
+        f = t.get('function') or {}
+        name = (f.get('name') or '').lower()
+        if not any(p in name for p in name_pats):
+            continue
+        props = ((f.get('parameters') or {}).get('properties') or {})
+        args_key = next((k for k in props if any(p in k.lower() for p in key_pats)), None)
+        if args_key:
+            return f.get('name'), args_key
+    return None, None
+
+
+def bridge_tool_call(agent_json, openai_body):
+    """上游 tool JSON -> OpenAI tool_calls(桥接到客户端声明的执行类工具)。
+    返回 {'id','name','arguments'(str)} 或 None(无可桥接工具时走文本转译)。"""
+    ut = agent_json.get('tool')
+    if not isinstance(ut, dict) or not openai_body.get('tools'):
+        return None
+    cmd = (ut.get('args') or {}).get('command')
+    if not cmd:
+        return None
+    tname, akey = pick_exec_tool(openai_body['tools'])
+    if not tname:
+        return None
+    return {'id': 'call_' + uuid.uuid4().hex[:24], 'name': tname,
+            'arguments': json.dumps({akey: cmd}, ensure_ascii=False)}
+
+
 def try_unwrap_agent_json(full_text):
     """模型常输出 ```json {"action":"...","taskCompletion":"..."} ```,
     反代给其他 agent 用时应剥掉这层壳,取用户可读的文本字段。
@@ -259,7 +307,6 @@ def try_unwrap_agent_json(full_text):
     if o.get('thinking'):
         return o['thinking']
     return None
-
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -324,15 +371,26 @@ class Handler(BaseHTTPRequestHandler):
                 c, r = extract_text(ev)
                 content += c
                 reasoning += r
-            unwrapped = try_unwrap_agent_json(content)
-            if unwrapped is not None:
-                content = unwrapped
+            message = {'role': 'assistant', 'content': content, 'reasoning_content': reasoning or None}
+            finish = 'stop'
+            agent_json = parse_agent_json(content)
+            if agent_json is not None:
+                bridged = bridge_tool_call(agent_json, openai_body)
+                if bridged is not None:
+                    # 客户端声明了 tools:翻译成标准 tool_calls,宿主 agent 会自己执行并回传结果
+                    message = {'role': 'assistant', 'content': agent_json.get('thinking') or None,
+                               'tool_calls': [{'id': bridged['id'], 'type': 'function',
+                                               'function': {'name': bridged['name'],
+                                                            'arguments': bridged['arguments']}}]}
+                    finish = 'tool_calls'
+                else:
+                    unwrapped = try_unwrap_agent_json(content)
+                    if unwrapped is not None:
+                        message['content'] = unwrapped
             return self._json(200, {
                 'id': cid, 'object': 'chat.completion', 'created': created,
                 'model': model_name,
-                'choices': [{'index': 0, 'finish_reason': 'stop',
-                             'message': {'role': 'assistant', 'content': content,
-                                         'reasoning_content': reasoning or None}}],
+                'choices': [{'index': 0, 'finish_reason': finish, 'message': message}],
                 'usage': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
             })
 
@@ -344,12 +402,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Connection', 'close')
         self.end_headers()
 
-        def sse_chunk(delta_content=None, delta_reasoning=None, finish=None):
+        def sse_chunk(delta_content=None, delta_reasoning=None, finish=None, tool_calls=None):
             delta = {}
             if delta_content is not None:
                 delta['content'] = delta_content
             if delta_reasoning is not None:
                 delta['reasoning_content'] = delta_reasoning
+            if tool_calls is not None:
+                delta['tool_calls'] = tool_calls
             chunk = {
                 'id': cid, 'object': 'chat.completion.chunk',
                 'created': created, 'model': model_name,
@@ -370,13 +430,23 @@ class Handler(BaseHTTPRequestHandler):
                 if c:
                     full_content += c
                     pending.append(c)
-            unwrapped = try_unwrap_agent_json(full_content)
-            if unwrapped is not None:
-                self.wfile.write(sse_chunk(delta_content=unwrapped))
+            agent_json = parse_agent_json(full_content)
+            bridged = bridge_tool_call(agent_json, openai_body) if agent_json is not None else None
+            if bridged is not None:
+                if agent_json.get('thinking'):
+                    self.wfile.write(sse_chunk(delta_content=agent_json['thinking']))
+                self.wfile.write(sse_chunk(tool_calls=[{
+                    'index': 0, 'id': bridged['id'], 'type': 'function',
+                    'function': {'name': bridged['name'], 'arguments': bridged['arguments']}}]))
+                self.wfile.write(sse_chunk(finish='tool_calls'))
             else:
-                for c in pending:
-                    self.wfile.write(sse_chunk(delta_content=c))
-            self.wfile.write(sse_chunk(finish='stop'))
+                unwrapped = try_unwrap_agent_json(full_content)
+                if unwrapped is not None:
+                    self.wfile.write(sse_chunk(delta_content=unwrapped))
+                else:
+                    for c in pending:
+                        self.wfile.write(sse_chunk(delta_content=c))
+                self.wfile.write(sse_chunk(finish='stop'))
             self.wfile.write(b'data: [DONE]\n\n')
             self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
