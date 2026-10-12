@@ -253,7 +253,9 @@ def try_unwrap_agent_json(full_text):
     tool = o.get('tool')
     if isinstance(tool, dict):
         cmd = tool.get('args', {}).get('command') or tool.get('description') or json.dumps(tool.get('args', {}), ensure_ascii=False)
-        return f'[模型请求执行工具 {tool.get("name", "?")}: {cmd} — 反代无工具执行能力,已转为文本]'
+        thinking = o.get('thinking') or ''
+        head = f'{thinking}\n\n' if thinking else ''
+        return f'{head}我准备执行以下命令:\n\n```bash\n{cmd}\n```\n\n(由反代从上游工具调用转译;请确认后自行执行或让宿主 agent 执行)'
     if o.get('thinking'):
         return o['thinking']
     return None
