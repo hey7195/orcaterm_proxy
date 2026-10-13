@@ -479,8 +479,7 @@ class Handler(BaseHTTPRequestHandler):
             # 但壳标志可能在文本中间出现(模型先说话再吐 ```json {"action":...}```),
             # passthrough 期间持续探测,发现即转攒壳。攒壳期间发 SSE 注释行心跳。
             full_content, full_reasoning = '', ''
-            sent = 0              # passthrough 已实际发出的字符数
-            passed_text = ''      # 转 buffer 时的正文切分点(= 已发出量)
+            sent = 0              # passthrough 已实际发出的字符数;转 buffer 后 = 壳起点(壳从这之后切)
             mode = 'probe'        # probe -> passthrough | buffer;passthrough -可-> buffer
             last_beat = time.time()
             for ev in iter_sse(resp, watchdog=UPSTREAM_TIMEOUT):
@@ -513,7 +512,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(sse_chunk(delta_content=full_content[sent:cut]))
                         self.wfile.flush()
                         last_beat = now
-                        passed_text, sent = cut, cut
+                        sent = cut
                         mode = 'buffer'
                         continue
                 if mode == 'passthrough':
@@ -530,7 +529,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(sse_chunk(finish='stop'))
             else:
                 # 壳模式:正文前缀(若有)已透传;壳部分剥完一次性发(tool_calls 桥接或纯文本)
-                shell_text = full_content[len(passed_text):]
+                shell_text = full_content[sent:]
                 agent_json = parse_agent_json(shell_text)
                 bridged = bridge_tool_call(agent_json, openai_body) if agent_json is not None else None
                 if bridged is not None:
