@@ -53,10 +53,14 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def looks_like_agent_json(text):
-    """流式前缀探测:开头是否像 agent JSON 壳({ 或 ```json)。
+    """流式前缀探测:开头是否像 agent JSON 壳({ / ```json / <tool_call>)。
     像才需要攒完整流剥壳,否则纯文本实时透传。"""
     t = text.lstrip()
-    return t.startswith('{') or t.startswith('```')
+    return t.startswith(('{', '```', '<tool_call'))
+
+
+# 中途壳标志:```json 围栏、{ "action" (允许空格)、<tool_call> XML 包裹
+_SHELL_MARK_RE = re.compile(r'```json|\{\s*"action"|<tool_call')
 
 # token 缓存:OrcaTerm 刷新 token 后不一定回写 data.bin(实测 19:02 换的 token 只在前端内存),
 # 所以优先走 CDP 从前端拿活 token,拿不到再退回 data.bin。
@@ -257,17 +261,43 @@ def extract_text(obj):
     return obj.get('content') or '', obj.get('reasoningContent') or ''
 
 
+def _salvage_agent_json(text):
+    """模型偶尔在 command 值里嵌未转义引号(如 LOG="..." 的 Windows 路径),
+    严格 JSON 解析整个壳失败。用容错正则抢救桥接所需的最小字段集。"""
+    def grab(pat):
+        m = re.search(pat, text, re.S)
+        return m.group(1).strip() if m else None
+    # command 通常是最后一个字段:贪心到结尾闭合括号前的最后一个引号
+    cmd = grab(r'"command"\s*:\s*"(.*)"\s*\}\s*\}\s*\}?\s*$') \
+       or grab(r'"command"\s*:\s*"(.*)"')
+    if not cmd:
+        return None
+    o = {'action': grab(r'"action"\s*:\s*"([^"]*)"') or 'review',
+         'tool': {'name': grab(r'"name"\s*:\s*"(execute_command|fetch|web[\w-]*)"') or 'execute_command',
+                  'args': {'command': cmd}}}
+    thinking = grab(r'"thinking"\s*:\s*"(.*)"\s*,\s*"(?:taskCompletion|question|answer|tool)"')
+    if thinking:
+        o['thinking'] = thinking
+    return o
+
+
 def parse_agent_json(full_text):
-    """完整解析模型输出的 agent JSON 壳,返回 dict 或 None。"""
-    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', full_text, re.S) \
-        or re.fullmatch(r'\s*(\{.*?\})\s*', full_text, re.S)
-    if not m:
-        return None
-    try:
-        o = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
-    return o if isinstance(o, dict) and 'action' in o else None
+    """完整解析模型输出的 agent JSON 壳,返回 dict 或 None。
+    支持三种包裹:```json 围栏 / 裸 JSON / <tool_call>json ... </tool_call>(模型幻觉的 XML 包裹)。
+    严格解析失败时走容错抢救,只要能拿到 args.command 就够桥接。"""
+    t = full_text.strip()
+    t = re.sub(r'^<tool_call>\s*(?:json)?\s*', '', t)
+    t = re.sub(r'\s*</tool_call>\s*$', '', t)
+    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', t, re.S) \
+        or re.fullmatch(r'\s*(\{.*?\})\s*', t, re.S)
+    if m:
+        try:
+            o = json.loads(m.group(1))
+            if isinstance(o, dict) and 'action' in o:
+                return o
+        except json.JSONDecodeError:
+            pass
+    return _salvage_agent_json(t)
 
 
 def pick_exec_tool(tools):
@@ -319,16 +349,8 @@ def try_unwrap_agent_json(full_text):
     变体: completion/ask 有 taskCompletion/question;
     review/thinking 直接带 thinking 或内嵌 tool 调用(OpenAI 客户端无法执行,
     降级为"想执行什么命令"的可读说明)。"""
-    # 兼容无 ``` 包裹的裸 JSON
-    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', full_text, re.S) \
-        or re.fullmatch(r'\s*(\{.*?\})\s*', full_text, re.S)
-    if not m:
-        return None
-    try:
-        o = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(o, dict) or 'action' not in o:
+    o = parse_agent_json(full_text)
+    if o is None:
         return None
     for k in ('taskCompletion', 'question', 'answer', 'content', 'result'):
         if o.get(k):
@@ -457,8 +479,8 @@ class Handler(BaseHTTPRequestHandler):
             # 但壳标志可能在文本中间出现(模型先说话再吐 ```json {"action":...}```),
             # passthrough 期间持续探测,发现即转攒壳。攒壳期间发 SSE 注释行心跳。
             full_content, full_reasoning = '', ''
-            passed_text = ''      # passthrough 阶段已透传的正文(转 buffer 后,壳部分从这之后切)
-            pending = []          # 攒壳模式下的 content 片段
+            sent = 0              # passthrough 已实际发出的字符数
+            passed_text = ''      # 转 buffer 时的正文切分点(= 已发出量)
             mode = 'probe'        # probe -> passthrough | buffer;passthrough -可-> buffer
             last_beat = time.time()
             for ev in iter_sse(resp, watchdog=UPSTREAM_TIMEOUT):
@@ -482,19 +504,29 @@ class Handler(BaseHTTPRequestHandler):
                         if looks_like_agent_json(full_content) and len(full_content.strip()) < 24:
                             continue  # 还不能确定,继续攒
                         mode = 'buffer' if looks_like_agent_json(full_content) else 'passthrough'
-                elif mode == 'passthrough' and ('```json' in full_content or '{"action"' in full_content):
-                    # 中途冒出壳标志:转攒壳。passed_text 取壳标志之前的部分
-                    # (被截断的标志串会在下一个 chunk 补全,这里每次都重算)
-                    cut = max(full_content.rfind('```json'), full_content.rfind('{"action"'))
-                    passed_text = full_content[:cut] if cut > 0 else ''
-                    mode = 'buffer'
+                elif mode == 'passthrough':
+                    m = _SHELL_MARK_RE.search(full_content, sent)  # 只查未发出部分,标志跨 chunk 截断不漏头
+                    if m:
+                        # 中途冒出壳标志(```json / { "action" / <tool_call):转攒壳。
+                        cut = m.start()
+                        # 先补发标志之前、还没发出的正文
+                        self.wfile.write(sse_chunk(delta_content=full_content[sent:cut]))
+                        self.wfile.flush()
+                        last_beat = now
+                        passed_text, sent = cut, cut
+                        mode = 'buffer'
+                        continue
                 if mode == 'passthrough':
-                    self.wfile.write(sse_chunk(delta_content=c))
-                    self.wfile.flush()
-                    last_beat = now
-                else:
-                    pending.append(c)
+                    # 尾部扣住可能的截断标志头(24 字符 = 最长标志 <tool_call>json 长度余量),标志补全前不发
+                    emit_upto = len(full_content) - 24 if len(full_content) > 24 else 0
+                    if emit_upto > sent:
+                        self.wfile.write(sse_chunk(delta_content=full_content[sent:emit_upto]))
+                        self.wfile.flush()
+                        last_beat = now
+                        sent = emit_upto
             if mode == 'passthrough':
+                if len(full_content) > sent:  # 补发尾部扣住的截断余量
+                    self.wfile.write(sse_chunk(delta_content=full_content[sent:]))
                 self.wfile.write(sse_chunk(finish='stop'))
             else:
                 # 壳模式:正文前缀(若有)已透传;壳部分剥完一次性发(tool_calls 桥接或纯文本)
