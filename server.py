@@ -1,14 +1,15 @@
 """
-OrcaTerm AI 反代 —— 把 OrcaTerm(腾讯云 LightAI) 的 AI 额度暴露为 OpenAI 兼容 API。
+OrcaTerm AI 反代 —— 把 OrcaTerm(腾讯云 LightAI) 的 AI 额度暴露为 OpenAI / Anthropic 兼容 API。
 
 用法:
   python server.py                 # 监听 0.0.0.0:8117
-  API_KEY=sk-xxx python server.py # 要求客户端带 Authorization: Bearer sk-xxx
+  API_KEY=sk-xxx python server.py # 要求客户端带 Authorization: Bearer sk-xxx 或 x-api-key
   INJECT_SYSTEM="..." python server.py  # 注入系统提示,覆盖上游的 OrcaTerm 运维助手人设
 
 端点:
-  GET  /v1/models
-  POST /v1/chat/completions       (支持 stream / 非流式)
+  GET  /v1/models                 (OpenAI)
+  POST /v1/chat/completions       (OpenAI,支持 stream / 非流式)
+  POST /v1/messages               (Anthropic Messages,支持 stream / 非流式)
 
 凭证: 自动从 OrcaTerm data.bin 读取 JWT + 身份信息。
 JWT 过期(2h)后需要重新打开 OrcaTerm 登录刷新——本服务每次请求都重读文件,
@@ -22,6 +23,8 @@ import uuid
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import anthropic_compat
 
 DATA_BIN = os.path.expandvars(r'%APPDATA%/com.orcaterm-desktop.app/data.bin')
 UPSTREAM = 'https://lightai.cloud.tencent.com/assistant/chat?name=orcaterm&mode=0&csrfCode=&sseresume=true'
@@ -383,8 +386,10 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         if not API_KEY:
             return True
-        h = self.headers.get('Authorization', '')
-        return h == f'Bearer {API_KEY}'
+        # OpenAI 客户端走 Authorization: Bearer;Anthropic SDK 走 x-api-key
+        if self.headers.get('Authorization', '') == f'Bearer {API_KEY}':
+            return True
+        return self.headers.get('x-api-key', '') == API_KEY
 
     # ---- routes ----
     def do_GET(self):
@@ -398,24 +403,43 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {'error': {'message': 'not found'}})
 
     def do_POST(self):
-        if self.path != '/v1/chat/completions':
+        handlers = {
+            '/v1/chat/completions': self._handle_openai_chat,
+            '/v1/messages': self._handle_anthropic_messages,
+        }
+        handler = handlers.get(self.path)
+        if handler is None:
             return self._json(404, {'error': {'message': 'not found'}})
         if not self._authed():
             return self._json(401, {'error': {'message': 'bad api key'}})
         length = int(self.headers.get('Content-Length', 0))
         try:
-            openai_body = json.loads(self.rfile.read(length) or b'{}')
+            body = json.loads(self.rfile.read(length) or b'{}')
         except json.JSONDecodeError:
             return self._json(400, {'error': {'message': 'invalid json'}})
+        return handler(body)
 
+    def _handle_openai_chat(self, openai_body):
+        return self._proxy_chat(openai_body)
+
+    def _handle_anthropic_messages(self, anth_body):
+        # Anthropic 请求 -> 内部 OpenAI 形态,复用同一条上游链路;错误也按 Anthropic 格式回
+        internal = anthropic_compat.anthropic_to_internal(anth_body)
+        return self._proxy_chat(internal, protocol='anthropic')
+
+    def _proxy_chat(self, openai_body, protocol='openai'):
+        """协议无关的聊天主链路:上游请求、剥壳、桥接、流式探测全在这里;
+        出口由 protocol 决定用哪种 SSE/响应格式。"""
+        err_fmt = (lambda code, msg: self._json(code, {'type': 'error', 'error': {'type': 'api_error', 'message': msg}})
+                   if protocol == 'anthropic' else self._json)
         try:
             resp = open_upstream(openai_body)
         except urllib.error.HTTPError as e:
-            return self._json(502, {'error': {'message': f'upstream {e.code}: {e.read().decode(errors="replace")[:300]}'}})
+            return err_fmt(502, f'upstream {e.code}: {e.read().decode(errors="replace")[:300]}')
         except FileNotFoundError:
-            return self._json(503, {'error': {'message': 'data.bin not found — 先安装并登录 OrcaTerm'}})
+            return err_fmt(503, 'data.bin not found — 先安装并登录 OrcaTerm')
         except Exception as e:
-            return self._json(502, {'error': {'message': f'upstream error: {e}'}})
+            return err_fmt(502, f'upstream error: {e}')
 
         model_name = openai_body.get('model', DEFAULT_MODEL)
         stream = bool(openai_body.get('stream'))
@@ -444,6 +468,14 @@ class Handler(BaseHTTPRequestHandler):
                     unwrapped = try_unwrap_agent_json(content)
                     if unwrapped is not None:
                         message['content'] = unwrapped
+            if protocol == 'anthropic':
+                tc = (message.get('tool_calls') or [None])[0]
+                tool_call = ({'id': tc['id'], 'name': tc['function']['name'],
+                              'arguments': tc['function']['arguments']} if tc else None)
+                anth = anthropic_compat.internal_to_anthropic_response(
+                    model_name, agent_json.get('thinking') if agent_json else (reasoning or None),
+                    message.get('content') or '', tool_call, finish)
+                return self._json(200, anth)
             return self._json(200, {
                 'id': cid, 'object': 'chat.completion', 'created': created,
                 'model': model_name,
@@ -474,6 +506,26 @@ class Handler(BaseHTTPRequestHandler):
             }
             return ('data: ' + json.dumps(chunk, ensure_ascii=False) + '\n\n').encode()
 
+        # 协议出口:openai 用 chunk 流;anthropic 用事件流发射器
+        if protocol == 'anthropic':
+            astream = anthropic_compat.AnthropicStream(model_name)
+
+        def emit(payloads):
+            for p in payloads or []:
+                self.wfile.write(p)
+
+        def emit_text(delta):
+            if protocol == 'anthropic':
+                emit(astream.text_delta(delta))
+            else:
+                self.wfile.write(sse_chunk(delta_content=delta))
+
+        def emit_thinking(delta):
+            if protocol == 'anthropic':
+                emit(astream.thinking_delta(delta))
+            else:
+                self.wfile.write(sse_chunk(delta_reasoning=delta))
+
         try:
             # 流式策略:纯文本(_FMT_GUARD 生效后是常态)逐 chunk 实时透传;
             # 但壳标志可能在文本中间出现(模型先说话再吐 ```json {"action":...}```),
@@ -482,16 +534,21 @@ class Handler(BaseHTTPRequestHandler):
             sent = 0              # passthrough 已实际发出的字符数;转 buffer 后 = 壳起点(壳从这之后切)
             mode = 'probe'        # probe -> passthrough | buffer;passthrough -可-> buffer
             last_beat = time.time()
+            if protocol == 'anthropic':
+                # 首事件 message_start 必须最先发
+                emit(astream.start())
+                self.wfile.flush()
             for ev in iter_sse(resp, watchdog=UPSTREAM_TIMEOUT):
                 now = time.time()
                 if now - last_beat > HEARTBEAT_SEC:
-                    self.wfile.write(b': heartbeat\n\n')  # SSE 注释行,客户端忽略但连接不冷
+                    # Anthropic 心跳用官方 ping 事件;OpenAI 用注释行
+                    self.wfile.write(astream.ping() if protocol == 'anthropic' else b': heartbeat\n\n')
                     self.wfile.flush()
                     last_beat = now
                 c, r = extract_text(ev)
                 if r:
                     full_reasoning += r
-                    self.wfile.write(sse_chunk(delta_reasoning=r))
+                    emit_thinking(r)
                     self.wfile.flush()
                     last_beat = now
                 if not c:
@@ -509,7 +566,7 @@ class Handler(BaseHTTPRequestHandler):
                         # 中途冒出壳标志(```json / { "action" / <tool_call):转攒壳。
                         cut = m.start()
                         # 先补发标志之前、还没发出的正文
-                        self.wfile.write(sse_chunk(delta_content=full_content[sent:cut]))
+                        emit_text(full_content[sent:cut])
                         self.wfile.flush()
                         last_beat = now
                         sent = cut
@@ -519,14 +576,18 @@ class Handler(BaseHTTPRequestHandler):
                     # 尾部扣住可能的截断标志头(24 字符 = 最长标志 <tool_call>json 长度余量),标志补全前不发
                     emit_upto = len(full_content) - 24 if len(full_content) > 24 else 0
                     if emit_upto > sent:
-                        self.wfile.write(sse_chunk(delta_content=full_content[sent:emit_upto]))
+                        emit_text(full_content[sent:emit_upto])
                         self.wfile.flush()
                         last_beat = now
                         sent = emit_upto
             if mode == 'passthrough':
                 if len(full_content) > sent:  # 补发尾部扣住的截断余量
-                    self.wfile.write(sse_chunk(delta_content=full_content[sent:]))
-                self.wfile.write(sse_chunk(finish='stop'))
+                    emit_text(full_content[sent:])
+                if protocol == 'anthropic':
+                    for p in astream.finish('stop'):
+                        self.wfile.write(p)
+                else:
+                    self.wfile.write(sse_chunk(finish='stop'))
             else:
                 # 壳模式:正文前缀(若有)已透传;壳部分剥完一次性发(tool_calls 桥接或纯文本)
                 shell_text = full_content[sent:]
@@ -534,16 +595,27 @@ class Handler(BaseHTTPRequestHandler):
                 bridged = bridge_tool_call(agent_json, openai_body) if agent_json is not None else None
                 if bridged is not None:
                     if agent_json.get('thinking'):
-                        self.wfile.write(sse_chunk(delta_content=agent_json['thinking']))
-                    self.wfile.write(sse_chunk(tool_calls=[{
-                        'index': 0, 'id': bridged['id'], 'type': 'function',
-                        'function': {'name': bridged['name'], 'arguments': bridged['arguments']}}]))
-                    self.wfile.write(sse_chunk(finish='tool_calls'))
+                        emit_text(agent_json['thinking'])
+                    if protocol == 'anthropic':
+                        for p in astream.tool_use(bridged['id'], bridged['name'], bridged['arguments']):
+                            self.wfile.write(p)
+                        for p in astream.finish('tool_calls'):
+                            self.wfile.write(p)
+                    else:
+                        self.wfile.write(sse_chunk(tool_calls=[{
+                            'index': 0, 'id': bridged['id'], 'type': 'function',
+                            'function': {'name': bridged['name'], 'arguments': bridged['arguments']}}]))
+                        self.wfile.write(sse_chunk(finish='tool_calls'))
                 else:
                     unwrapped = try_unwrap_agent_json(shell_text)
-                    self.wfile.write(sse_chunk(delta_content=unwrapped if unwrapped is not None else shell_text))
-                    self.wfile.write(sse_chunk(finish='stop'))
-            self.wfile.write(b'data: [DONE]\n\n')
+                    emit_text(unwrapped if unwrapped is not None else shell_text)
+                    if protocol == 'anthropic':
+                        for p in astream.finish('stop'):
+                            self.wfile.write(p)
+                    else:
+                        self.wfile.write(sse_chunk(finish='stop'))
+            if protocol != 'anthropic':
+                self.wfile.write(b'data: [DONE]\n\n')
             self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass  # 客户端断开
@@ -552,7 +624,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get('PORT', '8117'))
     srv = ThreadingHTTPServer(('0.0.0.0', port), Handler)
-    print(f'OrcaTerm OpenAI-compatible proxy on http://127.0.0.1:{port}/v1')
+    print(f'OrcaTerm proxy (OpenAI + Anthropic compatible) on http://127.0.0.1:{port}')
+    print(f'endpoints: /v1/chat/completions /v1/messages /v1/models')
     print(f'models: {", ".join(MODELS)}')
     print(f'auth: {"API_KEY required" if API_KEY else "no auth (local only)"}')
     print(f'inject: {"on (%d chars)" % len(INJECT_SYSTEM) if INJECT_SYSTEM else "off"}')
