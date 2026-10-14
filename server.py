@@ -264,24 +264,100 @@ def extract_text(obj):
     return obj.get('content') or '', obj.get('reasoningContent') or ''
 
 
+def _extract_balanced_json(text, start):
+    """从 text[start]({ 或 ```)开始提取第一个括号平衡的 {...}。
+    壳内字符串里可能出现未转义引号导致 json.loads 失败,平衡扫描不依赖引号配对,
+    只按花括号深度切——对残缺壳也能切出最外层完整边界。
+    返回 (json文本, 结束偏移) 或 (None, -1)。"""
+    i = text.find('{', start)
+    if i < 0:
+        return None, -1
+    depth = 0
+    for j in range(i, len(text)):
+        c = text[j]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1], j + 1
+    return None, -1  # 截断,无平衡闭合
+
+
+def _is_clean_command(cmd):
+    """桥接前命令洁净度检查:salvage 抢救的命令若吞进壳残渣
+    (JSON 尾/幻觉标签/下一个壳的开头),执行必然语法错,拒绝桥接。
+    注意 <> 是 shell 重定向合法字符,只拦花括号和标签形态残渣。"""
+    if re.search(r'[{}]', cmd):
+        return False
+    if re.search(r'</\w+>|<\w+_value>|<tool_call|<!\[', cmd):  # 幻觉标签残渣
+        return False
+    if re.search(r'"\s*[,}]', cmd):  # JSON 键值边界残渣
+        return False
+    if re.search(r'\b(action|thinking|taskCompletion|mcpServer)\b.*:', cmd):
+        return False
+    return True
+
+
 def _salvage_agent_json(text):
-    """模型偶尔在 command 值里嵌未转义引号(如 LOG="..." 的 Windows 路径),
-    严格 JSON 解析整个壳失败。用容错正则抢救桥接所需的最小字段集。"""
-    def grab(pat):
-        m = re.search(pat, text, re.S)
+    """模型输出的壳坏掉时(命令值内嵌未转义引号/多壳复读+截断),严格 JSON 解析
+    整壳失败。用容错方式抢救:从每个壳标志位置做括号平衡扫描,截出的片段再走
+    严格解析→字段级抓取;多壳复读时从后往前试(最后一个是本轮真实意图);
+    全是残壳时退到最后一步直接抓 command 值(残壳中段 command 仍完整)。
+    命令值做洁净度检查,吞了壳残渣的脏命令拒绝返回。"""
+    def _grab_all(pat, s):
+        m = re.search(pat, s, re.S)
         return m.group(1).strip() if m else None
-    # command 通常是最后一个字段:贪心到结尾闭合括号前的最后一个引号
-    cmd = grab(r'"command"\s*:\s*"(.*)"\s*\}\s*\}\s*\}?\s*$') \
-       or grab(r'"command"\s*:\s*"(.*)"')
-    if not cmd:
-        return None
-    o = {'action': grab(r'"action"\s*:\s*"([^"]*)"') or 'review',
-         'tool': {'name': grab(r'"name"\s*:\s*"(execute_command|fetch|web[\w-]*)"') or 'execute_command',
-                  'args': {'command': cmd}}}
-    thinking = grab(r'"thinking"\s*:\s*"(.*)"\s*,\s*"(?:taskCompletion|question|answer|tool)"')
-    if thinking:
-        o['thinking'] = thinking
-    return o
+
+    def _build(frag):
+        # 两个候选:配对版([^"]不跨引号,多壳场景防吞残渣)与贪心版(坏引号场景抓全命令)。
+        # 配对版可能过短(命令值内嵌引号时停在第一个闭引号,如 LOG=),
+        # 贪心版可能过长(多壳时吞残渣)——都做洁净度检查,取最长的干净结果。
+        cands = [_grab_all(r'"command"\s*:\s*"([^"]*)"', frag),
+                 _grab_all(r'"command"\s*:\s*"(.*)"\s*\}\s*\}\s*\}?\s*$', frag),
+                 _grab_all(r'"command"\s*:\s*"(.*)"', frag)]
+        cands = [c for c in cands if c and _is_clean_command(c)]
+        if not cands:
+            return None
+        cmd = max(cands, key=len)
+        o = {'action': _grab_all(r'"action"\s*:\s*"([^"]*)"', frag) or 'review',
+             'tool': {'name': _grab_all(r'"name"\s*:\s*"(execute_command|fetch|web[\w-]*)"', frag) or 'execute_command',
+                      'args': {'command': cmd}}}
+        thinking = _grab_all(r'"thinking"\s*:\s*"(.*)"\s*,\s*"(?:taskCompletion|question|answer|tool)"', frag)
+        if thinking:
+            o['thinking'] = thinking
+        return o
+
+    candidates = []
+    # 候选起点:所有壳标志位置(含 ```json 围栏、{ "action"、<tool_call> 内的 {)
+    for m in re.finditer(r'```json|\{\s*"action"', text):
+        candidates.append(m.start())
+    if '<tool_call' in text:
+        tc = text.find('<tool_call')
+        brace = text.find('{', tc)
+        if brace >= 0:
+            candidates.append(brace)
+    # 从后往前:复读场景最后一个壳才是本轮意图
+    for start in reversed(candidates):
+        frag, _end = _extract_balanced_json(text, start)
+        if frag is None:
+            continue
+        # 先试严格解析(平衡片段内字符串引号残缺时仍会失败,走字段抓取)
+        try:
+            o = json.loads(frag)
+            if isinstance(o, dict) and 'action' in o:
+                ut = o.get('tool')
+                cmd = ut.get('args', {}).get('command') if isinstance(ut, dict) else None
+                if cmd is None or _is_clean_command(cmd):
+                    return o
+                continue  # 严格解析过但命令脏(吞了残渣),试更早候选
+        except json.JSONDecodeError:
+            pass
+        o = _build(frag)
+        if o:
+            return o
+    # 全残壳(多壳复读且都截断):字段级直接在全文抓——上轮壳残段里的 command 就是本轮意图
+    return _build(text)
 
 
 def parse_agent_json(full_text):

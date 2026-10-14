@@ -80,11 +80,43 @@ def test_plain_text_untouched():
     print('PASS plain text')
 
 
+def test_salvage_multishell_repetition():
+    """实际泄漏样本(2026-10-14):上游复读上轮壳+幻觉标签+本轮壳截断,
+    三段拼接。旧实现贪心跨壳抓 command,把 "}}} </arg_value>{"action"... 垃圾
+    全吞进命令,桥接出必败命令(退出码 49)且 thinking 残渣泄漏成正文。"""
+    raw = ('我来查看当前安装的 MCP 配置。用户想查看当前安装了哪些 MCP。zcode 的 MCP 配置通常存放在'
+           '用户目录的 .zcode 配置文件中，我先读取配置文件来获取已安装的 MCP 列表。", "tool": {"type": "mcp", '
+           '"mcpServer": "mcp-server-orcaterm-oauth", "name": "execute_command", "description": "读取配置", '
+           '"args": {"command": "cat ~/.zcode/mcp.json 2>/dev/null || ls ~/.zcode/*.json 2>/dev/null"}}} '
+           '</arg_value>{"action": "review", "thinking": "您想查看当前安装了哪些 MCP。我先读取本机 zcode')
+    o = server.parse_agent_json(raw)
+    assert o, 'multi-shell salvage returned None'
+    cmd = o['tool']['args']['command']
+    assert cmd == 'cat ~/.zcode/mcp.json 2>/dev/null || ls ~/.zcode/*.json 2>/dev/null', cmd
+    # 桥接产出可执行 tool_calls
+    body = {'tools': [{'type': 'function', 'function': {
+        'name': 'Bash', 'parameters': {'properties': {'command': {}}}}}]}
+    b = server.bridge_tool_call(o, body)
+    assert b and json.loads(b['arguments'])['command'] == cmd
+    print('PASS salvage multi-shell repetition')
+
+
+def test_clean_command_allows_redirect():
+    """洁净度检查不能误伤 shell 重定向(2>/dev/null、>、heredoc)。"""
+    assert server._is_clean_command('cat a.log 2>/dev/null || ls *.json 2>/dev/null')
+    assert server._is_clean_command('tail -100 "LOG"')
+    assert not server._is_clean_command('cmd"}}} </arg_value>{"action"')
+    assert not server._is_clean_command('echo {action}')
+    print('PASS clean command redirect allowance')
+
+
 if __name__ == '__main__':
     test_shell_mark_regex()
     test_looks_like()
     test_parse_xmp_wrapper()
     test_salvage_broken_json()
+    test_salvage_multishell_repetition()
+    test_clean_command_allows_redirect()
     test_unwrap_completion()
     test_plain_text_untouched()
     print('ALL PASS')
